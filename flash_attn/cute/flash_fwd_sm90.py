@@ -53,6 +53,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def __init__(
         self,
         *args,
+        # if True, do n - 1 steep PV and n step QK^T softmax parallel
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
@@ -100,6 +101,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
+            # one wgmma do 64 rows, with 128 threads
             atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
         )
@@ -109,6 +111,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.MN,
             Float32,
+            # one wgmma do 64 rows, with 128 threads
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
             tiler_mn=(64, self.tile_hdimv),
             a_source=warpgroup.OperandSource.RMEM
@@ -124,6 +127,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ]
             for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
         ]
+        #Q and V use the same smem
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
@@ -207,13 +211,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
-        self.num_threads_per_warp_group = 128
+        self.num_threads_per_warp_group = 128 # 4warp per warp group, 32 threads per warp
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         assert self.num_wg_mma in [1, 2, 3]
+        # the total warp group are mma group add 1 extra group
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
-        self.num_producer_threads = 32
+        self.num_producer_threads = 32 # one warp for producer
         self.num_Q_load_threads = self.num_threads_per_warp_group  # If not TMA_Q
         self.num_epilogue_threads = self.num_mma_threads
+        # {}[]: {} to build a dict, [] to get the value of the dict
         self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
             self.num_wg_mma
         ]
@@ -224,14 +230,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self.intra_wg_overlap)
             else (self.num_wg_mma == 2)
         )
+        # need to be Regularization for TMA
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q
         # Producer needs more registers when doing cp.async Q or KV loads
+        # only when Q is not TMA, and KV is not TMA, and num_wg_mma == 2, we need more producer registers
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
+        # do [QKV layout] & [tile copy] setup (cuTe style)
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
@@ -272,6 +281,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             ]
         }
         make_tiled_tma_atom_fn = (
+            #partial supoort prebind some args for one function
             partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
             if const_expr(self.pack_gqa)
             else cpasync.make_tiled_tma_atom
@@ -290,7 +300,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_atom_K, tma_tensor_K = cpasync.make_tiled_tma_atom(
                 gmem_tiled_copy_KV,
                 mK,
-                cute.select(self.sK_layout, mode=[0, 1]),
+                cute.select(self.sK_layout, mode=[0, 1]), #layout use the 0, 1 dimensions, which is (tile_n, tile_hdim)
                 (self.tile_n, self.tile_hdim),
                 1,  # No mcast for now
             )
@@ -355,6 +365,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        #预先算好倒数的整数除法, 因为seqlen不确定, 算整数除法 在nvidia GPU上会被转成一二十个指令, 典型的高延迟, 低吞吐操作
+        #在进入kernel前预计算seqlen_q/k
         fastdiv_mods = utils.compute_fastdiv_mods(
             mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
         )
@@ -365,9 +377,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tma_tensor_V if const_expr(self.use_tma_KV) else mV,
             tma_tensor_O if const_expr(self.use_tma_O) else mO,
             mLSE,
-            mCuSeqlensQ,
-            mCuSeqlensK,
-            mSeqUsedQ,
+            mCuSeqlensQ, #前缀和偏移
+            mCuSeqlensK, #前缀和偏移
+            mSeqUsedQ, #没调序列实际使用的token数
             mSeqUsedK,
             mPageTable,
             tma_atom_Q,
@@ -583,7 +595,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         if warp_idx < 4:  # Producer
-            cute.arch.setmaxregister_decrease(self.num_producer_regs)
+            cute.arch.setmaxregister_decrease(self.num_producer_regs) #TMA can use less registers than cp.async, save some registers for consumer
             self.load(
                 mQ,
                 mK,
@@ -597,7 +609,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
-                gmem_tiled_copy_Q,
+                gmem_tiled_copy_Q, #if use_gqa, TMA may be unable to use TMA, such as tile_m % qhead_per_kvhead != 0, then use cp.async
                 mPageTable,
                 blocksparse_tensors,
                 block_info,
@@ -622,7 +634,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sVt,
                 sP,
                 sO,
-                learnable_sink,
+                #给每个Qhead 额外加一个可学习的logit, 形状(num_head,), 语义上等价于给softmax额外加一列, 值恒为0的虚拟KV, 只放大归一化常数, 不给O做任何贡献
+                #解决attention sink的问题, "没东西可看时可以把概率倒在"这个sink垃圾桶
+                learnable_sink, 
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
@@ -640,6 +654,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 fastdiv_mods,
             )
 
+    '''
+    four things:
+    1. use TMA or not
+    2. use GQA or not
+    3. use sparse block or not
+    4. use paged KV or not
+    '''
     @cute.jit
     def load(
         self,
@@ -682,6 +703,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # if work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
+                #seqlen_q: (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 head_idx_kv = (
                     head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -700,6 +722,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.use_tma_KV):
                     # === TMA path (non-paged and paged with page_size == n_block_size) ===
                     if const_expr(mPageTable is not None):
+                        # mK:(num_pages, page_size, h_k, d), mV:(num_pages, page_size, h_k, dv)
                         # Paged TMA: keep page dimension indexable
                         mK_cur = mK[None, None, head_idx_kv, None]
                         mV_cur = mV[None, None, head_idx_kv, None]
@@ -707,6 +730,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
                     else:
                         # Non-paged TMA
+                        # mK:(total_k, h_k, d), mV:(total_k, h_k, dv)
                         mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
                             None, None, head_idx_kv
                         ]
@@ -724,7 +748,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         tma_atom_V, 0, cute.make_layout(1), gV, sV
                     )
                     tma_load_V_fn = copy_utils.tma_producer_copy_fn(tma_load_V_fn, pipeline_v)
-                else:
+                else: # if const_expr(not self.use_tma_KV)
                     # === cp_async path (paged KV with page_size != n_block_size) ===
                     paged_kv_manager = PagedKVManager.create(
                         mPageTable,
@@ -813,6 +837,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
                             kv_producer_state.advance()
+                            # loop K
                             for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                                 n_block = n_block_max - 1 - i - 1
                                 page_idx = (
@@ -874,7 +899,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
                             kv_producer_state.advance()
-                else:
+                else: # if const_expr(self.use_block_sparsity)
                     # Block sparsity: use TMA closures directly (not paged)
                     # Load Q on pipeline_q, separate from K/V pipeline
                     if const_expr(self.use_tma_Q):
@@ -967,7 +992,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
-        aux_tensors = aux_data.tensors
+        aux_tensors = aux_data.tensors # support auxiliary tensors for varlen
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
@@ -1016,6 +1041,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             scores_scale = cute.make_rmem_tensor_like(softmax.row_max, Float32)
 
+        # mma_one_n_block: QK^T 和 PV串行发射, 中间夹softmax
+        # mma_one_n_block_intrawg_overlap: 两个wgmma背靠背, 用wati_group(1)隐藏softmax延迟
         mma_one_n_block_all = partial(
             self.mma_one_n_block_intrawg_overlap
             if const_expr(self.intra_wg_overlap)
@@ -1412,6 +1439,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_pipe_read.advance()
         return smem_pipe_read
 
+    '''
+    | 阶段 | TensorCore（异步队列，FIFO） | SIMT（当前 warpgroup）                  |
+    |-----|----------------------------|-----------------------                 |
+    | 1 | 发射 QKᵀ_i                    |                    —                   |
+    | 2 | 发射 PV_{i-1}                 |                    —                   |
+    | 3 | QKᵀ_i 完成                    | `wait_group(1)` → 释放 K buffer         |
+    | 4 | PV_{i-1} 执行中                | mask / score_mod / softmax_i → 得到 P_i |
+    | 5 | PV_{i-1} 完成                 |      `wait_group(0)` → 释放 V，允许覆盖 P |
+    | 6 | —                            |                    写 P_i；rescale acc_O |
+    '''
+    # 这个函数先做上一step的PV, 然后再做当前step的QK, 这样可以在SIMT上mask/score_mod/softmax, 并且在PV执行时就可以rescale acc_O
     @cute.jit
     def mma_one_n_block_intrawg_overlap(
         self,
@@ -1432,7 +1470,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         check_inf: cutlass.Constexpr = True,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
-        smem_pipe_read.advance()
+        smem_pipe_read.advance() #updat phase
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
@@ -1444,7 +1482,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
-        warpgroup.wait_group(1)
+        warpgroup.wait_group(1) # wait Q @ K.T done, release K buffer
         pipeline_k.consumer_release(smem_pipe_read)
 
         # handle score mods and masking
@@ -1454,8 +1492,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mask_fn(acc_S=acc_S, n_block=n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
+        # Compute softmax and rescale O while PV GEMM is in flight
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
         warpgroup.wait_group(0)
+        # wait PV done, release V buffer
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (

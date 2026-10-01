@@ -162,8 +162,8 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
-        use_clc_scheduler: bool = False,
-        has_tile_count_semaphore: bool = False,
+        use_clc_scheduler: bool = False, # clc: cluster launch control, Blackwell new feature: CTA can ask GPU scheduler for new task to do, used for dynamic persistent tile scheduler here
+        has_tile_count_semaphore: bool = False, # used for self-impl work queue
         seqlen_k_per_split: Optional[int] = None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
@@ -175,16 +175,24 @@ class FlashAttentionForwardSm100:
         self.same_hdim_kv = head_dim == head_dim_v
         self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
-        self.check_hdim_oob = head_dim != self.head_dim_padded
+        self.check_hdim_oob = head_dim != self.head_dim_padded #oob: out of bound
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = q_stage
+        self.q_stage = q_stage # tensorCore & cudaCore/SFU parallel， ping pong (mma and softmax)
         assert self.q_stage in [1, 2]
         self.use_2cta_instrs = use_2cta_instrs
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
+        '''
+        softmax:   |—— 写前 3/4 P ——|—— 写后 1/4 P ——|
+                                    ↑ 发 barrier 信号
+        tensor core:                |—— 跑前 3/4 ——|—— 跑后 1/4 ——|
+                                                ↑
+                                这两个时刻要对齐：tensor core 啃完前 3/4
+                                的瞬间，softmax 刚好把最后 1/4 写进 TMEM
+        '''
         self.split_P_arrive = n_block_size // 4 * 3
         self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
         assert self.split_P_arrive % 32 == 0
@@ -239,7 +247,7 @@ class FlashAttentionForwardSm100:
         # despite the literal `is_sm103` name.
         is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
-        # SM103 ld.red is profitable except for D32 when scores are unmodified.
+        # SM103 ld.red（redundant） is profitable except for D32 when scores are unmodified.
         self.use_ldred_rowmax = (
             is_sm103
             and self.score_mod is None
@@ -302,6 +310,7 @@ class FlashAttentionForwardSm100:
 
         fa_log(1, f"TileScheduler={self.TileScheduler.__name__}, scheduling_mode={self.scheduling_mode.name}, USE_2CTA={self.use_2cta_instrs}")
 
+        # 16 warps per CTA
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
@@ -477,6 +486,7 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        # (s_q, d, h_q, b_q) or (total_q, d, h_q) if there's cu_seqlens_q
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -565,6 +575,7 @@ class FlashAttentionForwardSm100:
         )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
+            # V: cta_group_size
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_qk.thr_id.shape,)
         )
@@ -598,9 +609,13 @@ class FlashAttentionForwardSm100:
                 if not self.uneven_kv_smem
                 else (stride_sK + stride_sV) // 2
             )
+            # composed Layout： coord -> inner(offset + outer(coord))
+            # outer: normal layout, (shape + stride), compute offset
+            # inner: such as swizzle
             sK_layout = cute.make_composed_layout(
                 sK_layout.inner,
                 0,
+                # shape + stride
                 cute.make_layout(
                     (*sK_layout.outer.shape[:-1], self.kv_stage),
                     stride=(*sK_layout.outer.stride[:-1], stage_stride),
@@ -804,6 +819,7 @@ class FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        # precomte for divide, because divide can take a lot of instrution in GPU
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable)
 
         head_divmod = None
@@ -929,7 +945,7 @@ class FlashAttentionForwardSm100:
         1. Load warp: Loads Q, K, V data from global memory to shared memory using TMA
         2. MMA warp: Performs matrix multiplications (Q*K^T and P*V)
         3. Softmax warps: Compute softmax normalization on attention scores
-        4. Correction warps: Apply adjustments to intermediate results
+        4. Correction warps: Apply adjustments to intermediate results(O <- O * exp(m_old - m_new))
         5. Epilogue warp: Handles final output transformation and storage
 
         The kernel implements a complex pipeline with overlapping computation and memory operations,
@@ -1141,6 +1157,7 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
+        # Scale: row_sum and row_max
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
@@ -1205,9 +1222,9 @@ class FlashAttentionForwardSm100:
 
         sched_ctx = None
         if const_expr(self.use_clc_scheduler or self.dynamic_persistent):
-            sched_response_ptr = storage.sched_response.data_ptr()
-            sched_mbar_ptr = storage.sched_mbar_ptr.data_ptr()
-            sched_producer_group = cutlass_pipeline.CooperativeGroup(
+            sched_response_ptr = storage.sched_response.data_ptr() # the next task will be done by the scheduler
+            sched_mbar_ptr = storage.sched_mbar_ptr.data_ptr() # the mbarrier of this pipeline
+            sched_producer_group = cutlass_pipeline.CooperativeGroup( # default one thread
                 cutlass_pipeline.Agent.Thread
             )
             num_sched_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
@@ -1456,6 +1473,13 @@ class FlashAttentionForwardSm100:
 
         return
 
+    # 持久化循环 → 算 gK/gV/gQ → 绑 TMA copy fn → 先发 K0/Q，再 K/V 交替推进（same with sm90）
+    # difference：
+    # 1. KV 共用一条pipeline(kv 各占一个stage)， sm90用的是独立的两条
+    # 2. sm90直接从gmem tile建copy fn, sm100要先过thr_mma 的partition， 再构建tma atom， sm100内嵌了mma tiling和cluster信息
+    # 3. sm100的q被拆成两个sub-tile, 拆成两个·18行的sub-tile分别喂给softmax0和softmax1
+    # 4. sm100支持动态选择warp来发送load指令（分是否用tma， 是否用q_stage == 1)
+    # 5. sm100没有intra_wg_overlap, 因为hopper下为了让mma和下一轮load重叠， 必须再软件层把V的加载往后错一拍， sm100完全没有这个分支
     @cute.jit
     def load(
         self,
@@ -1721,6 +1745,8 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
     ):
+        # actually, in sm100+, mma don't use fragment, data will be loaded from smem or tmem
+        # cute: t <x> <mem> <Y> -> tensor <which gemm partiton: S(QK GEMM) or O(PV GEMM)> <mem type: smem or tmem> <tensor Name>
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
@@ -1729,6 +1755,9 @@ class FlashAttentionForwardSm100:
         else:
             tSrQs = (tSrQ[None, None, None, 0],)
 
+        # PTX: tcgen05.mma.cta_group::2.kind::f16  [tmem_acc], smem_desc_a, smem_desc_b, idesc, p;
+        #                                             ↑           ↑            ↑           ↑
+        #                                          累加器地址   A的smem描述符  B的smem描述符  指令描述符
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
         qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
         qk_mma_kind = sm100_utils._tcgen05_mma_kind(qk_mma_op)
@@ -1744,6 +1773,9 @@ class FlashAttentionForwardSm100:
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
+            # [关键技巧]
+            # 在编译器“柯里化”出q_stage个专用的QK GEMM发射器， 把所有的编译器常量提前绑死， 让运行时调用点只剩一个参数
+            # Q与计算， 只有K需要编译期确定
         gemm_Si = [
             partial(
                 # sm100_utils.gemm_ptx_precomputed,
@@ -1758,9 +1790,11 @@ class FlashAttentionForwardSm100:
                 # idesc=qk_mma_idesc,
                 smem_desc_base_b=k_smem_base,
                 tCrB_layout=tSrK[None, None, None, 0].layout,
+                # 改成声明跨调用持久的ptx寄存器
                 smem_var_name_prefix="fa_fwd_q_smem_desc",
                 idesc_var_name="fa_fwd_qk_mma_idesc",
                 kind=qk_mma_kind,
+                # smem offset ping pong
                 smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                 zero_init=True,
                 cta_group=self.cta_group_size,
@@ -1810,8 +1844,13 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = Int32(0)
 
+        '''
+        mma warp:      QK(K0) │ PV(V0) QK(K1) │ PV(V1) QK(K2) │ ...
+        softmax warp:         │ S0→P0         │ S1→P1         │ ...
+                              └─ prologue 产出的 S0 让 softmax 有活干
+        '''
         work_tile = tile_scheduler.initial_work_tile_info()
-        while work_tile.is_valid_tile:
+        while work_tile.is_valid_tile: # persistent loop
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             block_iter_count = Int32(0)
@@ -1843,11 +1882,12 @@ class FlashAttentionForwardSm100:
                     split_idx=split_idx,
                     num_splits=num_splits,
                 )
-                block_iter_count = n_block_max - n_block_min
+                block_iter_count = n_block_max - n_block_min # 算出这个tile 要跑多少个KV Block
                 process_tile = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
-            if process_tile and is_leader_cta:
-                for stage in cutlass.range_constexpr(self.q_stage):
+            # [prologue]： S0 = Q0*K0^T, S1 = Q1*K0^T
+            if process_tile and is_leader_cta: # 2CTA MMA只由cluster里的leader CTA发射一条指令
+                for stage in cutlass.range_constexpr(self.q_stage): # 编译期完全展开
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
                     pipeline_q.consumer_wait_w_index_phase(stage, mma_q_consumer_phase)
@@ -1866,6 +1906,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    # 除了sK的地址之外， 其他所有的内容都变成了编译期常量， 这是一个有趣的加速技巧
                     gemm_Si[stage](
                         smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                     )
@@ -1875,11 +1916,12 @@ class FlashAttentionForwardSm100:
                 mma_q_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
-                mma_kv_consumer_state.advance()
+                mma_kv_consumer_state.advance() # move forward
                 # End of GEMM (Q1 * K0 -> S1)
                 # Note: Q0 & Q1 are still needed in the seqlen_kv loop
                 # so we need to release them after the seqlen_kv loop
 
+                # [steady state]: for loop: PV(P_stage, V_{i - 1}) 然后 QK(Q_stage, K_i)
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
@@ -1890,7 +1932,7 @@ class FlashAttentionForwardSm100:
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
-                    for stage in cutlass.range_constexpr(self.q_stage):
+                    for stage in cutlass.range_constexpr(self.q_stage): # 编译期展开
                         # 2. acquire corrected O0/O1_partial and P0 / P1
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
@@ -1951,6 +1993,7 @@ class FlashAttentionForwardSm100:
                 # End of seqlen_kv loop
 
                 # release Q0 & Q1
+                # epilogue: 最后一轮PV
                 for stage in cutlass.range(self.q_stage):
                     pipeline_q.consumer_release_w_index(stage)
 
@@ -2000,7 +2043,7 @@ class FlashAttentionForwardSm100:
 
     # for both softmax0 and softmax1 warp group
     @cute.jit
-    def _kv_head_idx(self, head_idx: Int32) -> Int32:
+    def gkv_head_idx(self, head_idx: Int32) -> Int32:
         """Map query-head tile index -> KV-head index (FA3 descale semantics)."""
         if cutlass.const_expr(self.pack_gqa):
             return head_idx
@@ -2063,28 +2106,42 @@ class FlashAttentionForwardSm100:
         for computing exp(x) using exp2 functions. It also coordinates pipeline
         synchronization between MMA, correction, and sequence processing stages.
         """
+        # tidx 是在这个4 warps的group里的线程id
         tidx = cute.arch.thread_idx()[0] % (
             cute.arch.WARP_SIZE
             # * (len(self.softmax0_warp_ids) if stage == 0 else len(self.softmax1_warp_ids)
             * (len(self.softmax0_warp_ids))
         )
+        # 本组内的序号0...3
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         aux_tensors = aux_data.tensors
 
         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
         tSAcc = tStS[(None, None), 0, 0, stage]  # (128, 128)
         tStScale = cute.composition(tSAcc, cute.make_layout((self.m_block_size, 1)))
+        # 切掉tStS中间两个退化维和stage维
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScS = tScS[(None, None), 0, 0]  # (128, 128)
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-
-        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
+        # P复用S的TMEM
+        #
+        # TMEM 列:  0 ────────── 64 ────────── 128 ────────── 192 ...
+        #           │◄──── S0 (fp32, 128 列) ────►│
+        #           │           │◄─ P0 (16b, 64列) ─►│
+        #           ▲           ▲
+        #           scale 向量    tmem_p_offset[0] = 64
+        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width # = 128 // 32 * 16 = 64
+        # P只需要S的一半TMEM空间
         tStP_layout = cute.composition(
             tSAcc.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
         )
         tStP = cute.make_tensor(tSAcc.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
         tmem_load_op = (
+            # 32 x 32b = 128 列， 每个线程repet32次, 所以128列fp32 / 128 线程 * 32 = 每个线程取32个值
+            # [LdRed][硬件规约]： 是SM103（B300）的tcgen05.ld.red: 在搬数据的同时， 额外返回每个32宽子块的最大值到一个寄存器里——免费的硬件row-max规约。
+            # 请注意： 只有在sm103且没有score mod， 也没有mask mod的时候才能使用， 因为硬件在load时算的max是修改前的值， mask之后失效
+            # 所以其他的场景还是需要软件规约
             tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
             if const_expr(self.use_ldred_rowmax)
             else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
@@ -2092,7 +2149,8 @@ class FlashAttentionForwardSm100:
         tmem_load_atom = cute.make_copy_atom(tmem_load_op, self.qk_acc_dtype)
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tSAcc)  # (((32,32),1),1,4)
-
+        #scale 向量： 寄存器 -> TMEM
+        # repret = 1， 每个线程只存1个fp32. 这是softmax算出的acc_scale = exp2(m_old - m_new), 写到TMEM列0， 给correction warp 读去缩放O寄存器
         tmem_store_scale_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)), Float32
         )
@@ -2100,6 +2158,8 @@ class FlashAttentionForwardSm100:
             tidx
         )
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
+        # P: 寄存器 -> TMEM
+        # repret = 8/16， 每个线程存8/16个fp32.
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(
                 tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
@@ -2120,7 +2180,7 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
-            kv_head_idx = self._kv_head_idx(head_idx)
+            kv_head_idx = self._kv_head_idx(head_idx) # gqa -> kv_head
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx=split_idx, num_splits=num_splits,
@@ -2128,14 +2188,16 @@ class FlashAttentionForwardSm100:
             # Keep the dynamic num_splits for the block-sparse helpers below.
             num_splits_dyn = num_splits
             if const_expr(self.is_split_kv and block_info.pack_split_idx):
-                num_splits_dyn = split_idx >> 16
+                num_splits_dyn = split_idx >> 16 # 解包
                 split_idx = split_idx & 0xFFFF
 
+            # mask 闭包的构造
             mask = AttentionMaskCls(seqlen)
             shared_mask_kwargs = dict(
+                # scheduler 给的m_block是work tile粒度， 一个work tile覆盖q_stage x cta_group_size x m_block_size = 2 x 2 x 128 = 512行
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 thr_mma=thr_mma_qk,
-                thr_tmem_load=thr_tmem_load,
+                thr_tmem_load=thr_tmem_load, # 传进去是为了让mask知道本线程持有哪些（row, col), 然后用和t2r load相同的partition去切identity tensor
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 batch_idx=batch_idx,
@@ -2148,6 +2210,7 @@ class FlashAttentionForwardSm100:
             recompute_fastdiv_mods_q = cutlass.const_expr(
                 aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
             )
+            # varlen 的fastdiv mod 需要重算
             recompute_fastdiv_mods_k = cutlass.const_expr(
                 aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
             )
@@ -2185,8 +2248,8 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            # See Note [Low Precision Scaling]
-            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            # See Note [Low Precision Scaling] fp8 精度技巧
+            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0 # fp8 专用
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2194,8 +2257,12 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
-            rescale_threshold = 8.0 if const_expr(self.q_dtype.width == 16) else 0.0
+            # in softmax.py: 354-358
+            # 新 max 比旧 max 只大 8 个 log2 单位以内时，整个 O 的 rescale 直接跳过——correction warp 省掉一次 128×head_dim 的 TMEM 读改写。
+            # 代价是 P 可能达到 2^8，bf16 完全扛得住（log2 max ≈ 128）。
+            rescale_threshold = 8.0 if const_expr(self.q_dtype.width == 16) else 0.0 # 16bit 专用
             # See Note [Low Precision Scaling]
+            # conditonal softmax
             assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.q_dtype], (
                 f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
                 f"below log2(max {self.q_dtype} value) to avoid saturating P"
@@ -2226,8 +2293,10 @@ class FlashAttentionForwardSm100:
                 tile_block_count = n_block_max - n_block_min
                 has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
+            # 和 mma warp 的 gemm_Si 同样的套路：把本 tile 内不变的东西全部 partial 绑死
+            # （所有 pipeline、所有 TMEM partition、stage、batch/head/m_block、seqlen）。循环里只传 4 个变量
             softmax_step = partial(
-                self.softmax_step,
+                self.softmax_step, # 注意， softmax_step的前三个参数phase必须进出都传， 因为cuteDSL的循环是SSA形式， 没有可变变量， 循环携带的状态只能靠返回值回传
                 softmax=softmax,
                 thr_mma_qk=thr_mma_qk,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -2307,6 +2376,7 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 if has_work:
+                    # 第一次迭代单独拎出来
                     mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -2318,9 +2388,11 @@ class FlashAttentionForwardSm100:
                     n_block_max -= 1
                     # Next couple of iterations with causal masking
                     if const_expr(self.is_causal or self.is_local):
+                        # in block_info.py： 计算的是对角线穿过的最低block
                         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                             seqlen, m_block, n_block_min
                         )
+                        # 无mask 主体
                         for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                             n_block = n_block_max - 1 - n_tile
                             mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = (
@@ -2345,6 +2417,7 @@ class FlashAttentionForwardSm100:
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
                             )
                         else:
+                            # 没有mask
                             mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase, n_block,
                             )
@@ -2365,6 +2438,7 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
+                    # 结果交付
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
@@ -2401,8 +2475,28 @@ class FlashAttentionForwardSm100:
         # This is equivalent to pipeline_s0_s1.producer_tail
         if const_expr(self.s0_s1_barrier):
             if stage == 0:
+                # warp退出前必须等待最后一个consumer读完。 否则softmax warp先退出-> CTA可能释放smem/mbarrier
                 pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
 
+    '''
+    wait S ──► t2r 搬入寄存器 ──► score_mod ──► mask ──► row_max
+                                                           │
+                               ┌───────────────────────────┘
+                               ▼
+                 写 acc_scale 到 sScale ──► arrive(sm_stats_barrier)   ← 尽早放 correction warp 走
+                               │
+                               ▼
+                 S = S*scale - max*scale + offset   (fma_packed_f32x2)
+                               │
+                               ▼
+                 exp2 + 转 bf16  ──► P
+                               │
+                               ▼
+                 r2t 分批写回 TMEM ──► 中途 release 让 MMA 提前开跑
+                               │
+                               ▼
+                 update_row_sum  ──► 返回翻转后的三个 phase
+    '''
     @cute.jit
     def softmax_step(
         self,
@@ -2466,7 +2560,7 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_row_max = Float32(-Float32.inf)
         if const_expr(self.use_ldred_rowmax):
-            # ld.red returns each x32 tile's max in an extra register.
+            # ld.red returns each x32 tile's max in an extra register.[HW feature]
             tSrS_red = cute.make_rmem_tensor(((1, 1), *tSrS_t2r.shape[1:]), self.qk_acc_dtype)
             cute.copy(thr_tmem_load, tStS_t2r, (tSrS_t2r, tSrS_red))
             for i in cutlass.range_constexpr(cute.size(tSrS_red.shape)):
@@ -2508,20 +2602,32 @@ class FlashAttentionForwardSm100:
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         # pipeline_sm_stats.producer_commit_w_index(stage)
+        # [关键优化] 在exp2之前， 算出acc_scale就立刻写smem并arrive， correction warps马上可以O *= acc_scale, 和本warp的exp2并行
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
+        # in [softmax.py]: 算的是exp2(s*scale_log2 - max * scale_log2 + max_offset)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
+        # P的双类型别名
+        # 同一组寄存器， 不同的视图
+        # fp32，64个元素 给cute.copy做r2t搬运， 因为TMEM的store只有32-bit粒度， 两个bf16必须打包进一个32bit寄存器
         tSrP_r2t_f32 = cute.make_rmem_tensor(
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
+        # bf6，128个元素， 给apply_exp2_convert写入
+        # recast ptr让编译器知道这是同一块存储的两个解释， 不产生任何搬运指令
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
+        # softmax.py:429-464 把 128 个元素切成 4 个 32 元素的 fragment（frg_tile = 32），然后按这个条件决定走硬件还是模拟：
+        # if k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res  or  j >= frg_cnt - 1  or  j < ex2_emu_start_frg:
+        #     → cute.math.exp2(...)          # MUFU/SFU 流水线
+        # else:
+        #     → utils.ex2_emulation_2(...)   # 多项式近似，跑在 FMA 流水线
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
@@ -2529,20 +2635,25 @@ class FlashAttentionForwardSm100:
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
         # Sequence barrier arrive
+        # 两组softmax的错峰
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
+        # [split_P_arrive]: P写一半就让MMA开跑
+        # softmax:     |—— 写前 3/4 P ——|—— 写后 1/4 P ——|
+        #                               ↑ release
+        # tensor core:                  |—— 跑前 3/4 ——|—— 跑后 1/4 ——|
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
             if const_expr(self.split_P_arrive > 0):
                 split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.n_block_size
                 if const_expr(i + 1 == split_P_arrive_idx):
                     # Notify mma warp that the 1st half of P is ready
-                    cute.arch.fence_view_async_tmem_store()
+                    cute.arch.fence_view_async_tmem_store() # 前后两个fence都不能省略， 因为TMEM的store是异步的， 必须显示fence才能保证MMA看到数据
                     pipeline_s_p_o.consumer_release_w_index(stage)
         # Notify mma warp that the 2nd half of P is ready
-        cute.arch.fence_view_async_tmem_store()
+        cute.arch.fence_view_async_tmem_store() # 前后两个fence都不能省略， 因为TMEM的store是异步的， 必须显示fence才能保证MMA看到数据
         if const_expr(self.split_P_arrive > 0):
             cute.arch.sync_warp()
             with cute.arch.elect_one():
@@ -2550,6 +2661,8 @@ class FlashAttentionForwardSm100:
         else:
             pipeline_s_p_o.consumer_release_w_index(stage)
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+        # in softmax.py: 把旧的row_sum 先缩放再累加--obline softmax
+        # 这个update是纯寄存器规约， 不被任何人等待， 所以排在所有release/commit 之后， 让下游warp能尽早启动
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
@@ -3168,7 +3281,7 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
-            work_tile = tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.advance_to_next_work() # wait and read the prefetch result
             if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
                 prefix_str = "[CLC] query " if const_expr(self.use_clc_scheduler) else "[DYNAMIC] info "
                 fa_printf(
